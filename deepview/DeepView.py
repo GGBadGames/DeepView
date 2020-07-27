@@ -1,17 +1,16 @@
-from deepview.embeddings import init_umap, init_inv_umap
+from deepview.embeddings import init_umap, init_inv_umap#Mapper, InvMapper
 from deepview.fisher_metric import calculate_fisher
 
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import warnings
-import os
 
 class DeepView:
 
-	def __init__(self, pred_fn, classes, max_samples, batch_size, data_shape, n=5, 
-				 lam=0.65, resolution=100, cmap='tab10', interactive=True, verbose=True,
-				 title='DeepView', data_viz=None, mapper=None, inv_mapper=None, **kwargs):
+	def __init__(self, pred_fn, classes, max_samples, batch_size, data_shape, 
+				 n=5, lam=0.65, resolution=100, cmap='tab10', interactive=True, 
+				 title='DeepView', data_viz=None, mapper=None, inv_mapper=None, color_norming='standard',**kwargs):
 		'''
 		This class can be used to embed high dimensional data in
 		2D. With an inverse mapping from 2D back into the sample
@@ -22,7 +21,7 @@ class DeepView:
 		----------
 		pred_fn	: callable, function
 			Function that takes a single argument, which is data to be classified
-			and returns the prediction probabilities (valid / softmaxed) of the model.
+			and returns the prediction logits of the model.
 			For an example, see the demo jupyter notebook:
 			https://github.com/LucaHermes/DeepView/blob/master/DeepView%20Demo.ipynb
 		classes	: list, tuple of str
@@ -51,16 +50,12 @@ class DeepView:
 		interactive : bool
 			If interactive is true, the show() method won't be blocking, so code execution will continue.
 			Otherwise it will be blocking.
-		verbose : bool
-			If true, outputs information about the visualization progress.
 		title : str
 			The title for the plot
 		data_viz : callable, function
 			A function that takes in a single sample in the original sample shape and visualizes it.
 			This function will be called when the DeepView plot is clicked on, with the according data sample
-			or synthesised sample at the click location. If none is given, samples can still be visualized
-			automatically, as long as they have a shape like: (h,w), (h,w,3), (h,w,4), (3,h,w), (4,h,w).
-			In this case, the values are scaled to the interval [0, 1].
+			or synthesised sample at the click location.
 		mapper : object
 			An object that maps samples from the data input domain to 2D space. The object
 			must have the methods of deepview.embeddings.Mapper. fit is called with a distance matrix
@@ -87,6 +82,7 @@ class DeepView:
 		self.lam = lam
 		self.resolution = resolution
 		self.cmap = plt.get_cmap(cmap)
+		self.color_norming=color_norming
 		self.discr_distances = np.array([])
 		self.eucl_distances = np.array([])
 		self.samples = np.empty([0, *data_shape])
@@ -94,17 +90,18 @@ class DeepView:
 		self.y_true = np.array([])
 		self.y_pred = np.array([])
 		self.classifier_view = np.array([])
-		self.verbose = verbose
 		self.interactive = interactive
 		self.title = title
 		self.data_viz = data_viz
+		self.h=np.array([])
+		self.h_norm=np.array([])
+		self.h_original=np.array([])
+		self.mesh_preds=np.array([])
+		self.projection_errors=np.array([])
 		self._init_mappers(mapper, inv_mapper, kwargs)
 
 	@property
 	def num_samples(self):
-		'''
-		Returns the number of samples in DeepView.
-		'''
 		return len(self.samples)
 
 	@property
@@ -142,8 +139,8 @@ class DeepView:
 
 	def set_lambda(self, lam):
 		'''
-		Sets a new lambda and recomputes the embeddings and
-		decision boundary grid.
+		Dynamically sets a new lambda and recomputes the
+		embeddings, as the distances will also change.
 		'''
 		if self.lam == lam:
 			return
@@ -202,44 +199,31 @@ class DeepView:
 				fillstyle='none', ms=12, mew=2.5, zorder=1)
 			self.sample_plots.append(plot[0])
 
-		# set the mouse-event listeners
 		self.fig.canvas.mpl_connect('pick_event', self.show_sample)
 		self.fig.canvas.mpl_connect('button_press_event', self.show_sample)
 		self.disable_synth = False
 		self.ax.legend()
+		#plt.show(block=False)
 
-	def update_matrix(self, old_matrix, new_values):
+	def update_matrix(self, old_matrix, new_values, n_new, n_keep):
 		'''
 		When new distance values are calculated this merges old 
 		and new distances into the same matrix.
 		'''
-		n_new = new_values.shape[0]
-		n_keep = self.max_samples - n_new
 		to_triu = np.triu(old_matrix, k=1)
 		new_mat = np.zeros([self.num_samples, self.num_samples])
 		new_mat[n_new:,n_new:] = to_triu[:n_keep,:n_keep]
 		new_mat[:n_new] = new_values
+		# update the old distance matrix
 		return new_mat + new_mat.transpose()
 
 	def update_mappings(self):
-		if self.verbose:
-			print('Embedding samples ...')
-		
+		print('Embedding samples ...')
 		self.mapper.fit(self.distances)
 		self.embedded = self.mapper.transform(self.distances)
 		self.inverse.fit(self.embedded, self.samples)
-		self.classifier_view = self.compute_grid()
-
-	def queue_samples(self, samples, labels, preds):
-		'''
-		Adds samples labels and predictions to the according lists of
-		this deepview object. Old values will be discarded, when there are 
-		more then max_samples.
-		'''
-		# add new samples and remove depricated samples
-		self.samples = np.concatenate((samples, self.samples))[:self.max_samples]
-		self.y_pred = np.concatenate((preds, self.y_pred))[:self.max_samples]
-		self.y_true = np.concatenate((labels, self.y_true))[:self.max_samples]
+		self.projection_errors=abs(self.samples-self.inverse.transform(self.embedded))/self.samples
+		self.classifier_view, self.h_norm, self.h_original, self.h, self.mesh_preds= self.compute_grid()
 
 	def add_samples(self, samples, labels):
 		'''
@@ -252,18 +236,26 @@ class DeepView:
 		labels : array-like
 			List of labels for the sample points [n_samples, 1]
 		'''
-		# get predictions for the new samples
-		Y_probs = np.array(self.model(samples))
-		Y_preds = Y_probs.argmax(axis=1)
-		# add new values to the DeepView lists
-		self.queue_samples(samples, labels, Y_preds)
+		# prevent new samples to be bigger then maximum
+		samples = samples[:self.max_samples]
+		n_new = len(samples)
+
+		# add new samples and remove depricated samples
+		# and get predictions for the new samples
+		self.samples = np.concatenate((samples, self.samples))[:self.max_samples]
+		Y_preds = self.model(samples).argmax(axis=1)
+		self.y_pred = np.concatenate((Y_preds, self.y_pred))[:self.max_samples]
+		self.y_true = np.concatenate((labels, self.y_true))[:self.max_samples]
 
 		# calculate new distances
-		new_discr, new_eucl = calculate_fisher(self.model, samples, self.samples, 
-			self.n, self.batch_size, self.n_classes, self.verbose)
+		xs = samples
+		ys = self.samples
+		new_discr, new_eucl = calculate_fisher(self.model, xs, ys, self.n, 
+			self.batch_size, self.n_classes)
 		# add new distances
-		self.discr_distances = self.update_matrix(self.discr_distances, new_discr)
-		self.eucl_distances = self.update_matrix(self.eucl_distances, new_eucl)
+		n_keep = self.max_samples - n_new
+		self.discr_distances = self.update_matrix(self.discr_distances, new_discr, n_new, n_keep)
+		self.eucl_distances = self.update_matrix(self.eucl_distances, new_eucl, n_new, n_keep)
 
 		# update mappings
 		self.update_mappings()
@@ -272,8 +264,7 @@ class DeepView:
 		'''
 		Computes the visualisation of the decision boundaries.
 		'''
-		if self.verbose:
-			print('Computing decision regions ...')
+		print('Computing decision regions ...')
 		# get extent of embedding
 		x_min, y_min, x_max, y_max = self._get_plot_measures()
 		# create grid
@@ -285,45 +276,46 @@ class DeepView:
 		# map gridmpoint to images
 		grid_samples = self.inverse(grid)
 		n_points = self.resolution**2
-
 		mesh_preds = np.zeros([n_points, self.n_classes])
 
 		for i in range(0, n_points, self.batch_size):
 			n_preds = min(i+self.batch_size, n_points)
 			batch = grid_samples[i:n_preds]
 			# add epsilon for stability
-			mesh_preds[i:n_preds] = np.array(self.model(batch)) + 1e-8
-
+			mesh_preds[i:n_preds] = self.model(batch) + 1e-8
+		
 		self.mesh_classes = mesh_preds.argmax(axis=1)
 		mesh_max_class = max(self.mesh_classes)
-
 		# get color of gridpoints
 		color = self.cmap(self.mesh_classes/mesh_max_class)
 		# scale colors by certainty
 		h = -(mesh_preds*np.log(mesh_preds)).sum(axis=1)/np.log(self.n_classes)
-		h = (h/h.max()).reshape(-1, 1)
-		# adjust brightness
-		h = np.clip(h*1.2, 0, 1)
+		h_rs = h.reshape(-1, 1)
+		h_original = (h/h.max()).reshape(-1, 1)
+		h_norm=(h_rs-h_rs.mean())/(h_rs.std())
+		if self.color_norming=='standard':
+			# adjust brightness
+			h_4color = np.clip(h_original*1.2, 0, 1)
+		elif self.color_norming=='snv_sigmoid':
+			h_sig=1/(1+np.exp(-h_norm))
+			# adjust brightness
+			h_4color = np.clip(h_sig, 0, 1)		
+		elif self.color_norming=='snv_minmax':
+			h_minmax=(h_norm-h_norm.min())/(h_norm.max()-h_norm.min())
+			# adjust brightness
+			h_4color = np.clip(h_minmax, 0, 1)		
+		else:
+			print("Color Norming Unknown.")	
 		color = color[:,0:3]
-		color = (1-h)*(0.5*color) + h*np.ones(color.shape, dtype=np.uint8)
-		decision_view = color.reshape(self.resolution, self.resolution, 3)
-		return decision_view
+		color = (1-h_4color)*(0.5*color) + h_4color*np.ones(color.shape, dtype=np.uint8)
+		decision_view = color.reshape(self.resolution, self.resolution, 3)			
+		return decision_view, h_norm, h_original, h, mesh_preds
 
 	def get_mesh_prediction_at(self, x, y):
 		x_idx = np.abs(self.grid[0,0] - x).argmin(0)
 		y_idx = np.abs(self.grid[1,:,0] - y).argmin(0)
 		mesh = self.mesh_classes.reshape([self.resolution]*2)
 		return mesh[y_idx, x_idx]
-
-	def is_image(self, sample):
-		'''
-		Checks if the given sample can be plotted as an image.
-		Allowed shapes for images are (h,w), (h,w,3), (h,w,4).
-		'''
-		is_grayscale = len(sample.shape) == 2
-		is_colored = len(sample.shape) == 3 and \
-			(sample.shape[-1] == 3 or sample.shape[-1] == 4)
-		return is_grayscale or is_colored
 
 	def show_sample(self, event):
 		'''
@@ -363,36 +355,31 @@ class DeepView:
 			self.disable_synth = False
 			return
 
-		is_image = self.is_image(sample)
-		rank_perm = np.roll(range(len(sample.shape)), -1)
-		sample_T = sample.transpose(rank_perm)
-		is_transformed_image = self.is_image(sample_T)
+	
+		# allowed shapes for images are (h,w), (h,w,3), (h,w,4)
+		is_grayscale = len(sample.shape) == 2
+		is_colored = len(sample.shape) == 3 and \
+			(sample.shape[-1] == 3 or sample.shape[-1] == 4)
 
 		if self.data_viz is not None:
 			self.data_viz(sample, point, p, t)
-			return
 		# try to show the image, if the shape allows it
-		elif is_image:
-			img = sample - sample.min()
-		elif is_transformed_image:
-			img = sample_T - sample_T.min()
+		elif is_grayscale or is_colored:
+			f, a = plt.subplots(1, 1)
+			a.imshow(sample)
+			a.set_title(title)
 		else:
 			warnings.warn("Data visualization not possible, as the data points have"
 				"no image shape. Pass a function in the data_viz argument,"
 				"to enable custom data visualization.")
-			return
-
-		f, a = plt.subplots(1, 1)
-		a.imshow(img / img.max())
-		a.set_title(title)
-
+			
 	def get_artist_sample(self, point):
 		'''
 		Maps the location of an embedded point to it's image.
 		'''
 		sample_id = np.argmin(np.linalg.norm(self.embedded - point, axis=1))
 		sample = self.samples[sample_id]
-		sample = sample - sample.min()
+		sample = sample + np.abs(sample.min())
 		sample = sample / sample.max()
 		yp, yt = (int(self.y_pred[sample_id]), int(self.y_true[sample_id]))
 		return sample, yp, yt
@@ -418,16 +405,20 @@ class DeepView:
 		for c in range(self.n_classes):
 			data = self.embedded[self.y_true==c]
 			self.sample_plots[c].set_data(data.transpose())
+			#plot = ax.plot(*data.transpose(), 'o', c=self.cmap(c/9), 
+			#	label=self.classes[c])
 
 		for c in range(self.n_classes):
 			data = self.embedded[np.logical_and(self.y_pred==c, self.y_true!=c)]
 			self.sample_plots[self.n_classes+c].set_data(data.transpose())
+			#plot = ax.plot(*data.transpose(), 'o', markeredgecolor=self.cmap(c/9), 
+			#	fillstyle='none', ms=200, linewidth=3)
 
-		if os.name == 'posix':
-			self.fig.canvas.manager.window.raise_()
-			
 		self.fig.canvas.draw()
 		self.fig.canvas.flush_events()
+		#self.fig.show()
+		self.fig.show()
+		self.fig.canvas.manager.window.raise_()
 		plt.show()
 
 	@staticmethod
